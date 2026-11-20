@@ -1,24 +1,41 @@
 #!/usr/bin/env python3
-"""Neon Coastal Rarity Forecast — GTA VI trophy earn-rate forecaster.
+"""Neon Coastal Rarity Forecast v2 — GTA VI trophy earn-rate forecaster.
 
 Reads every *.in case file in the input dir and writes one <id>.out per
 case: five quantiles (5/25/50/75/95%) of each trophy's Exophase earn rate
 at the case target. Stdlib only, no network, fully deterministic.
 
-Model (generalises, never hardcodes any refresh):
-  rate = earners / players_tracked.  For each case we fit, on the reads of
-  the current regime (after the last big jump in players_tracked, else the
-  last 24 h, else all reads), a power law in hours since release,
-  log(P) = a + b*log(1 + x) for players and log(E_j) = a_j + b_j*log(1 + x)
-  for each trophy's earners (E_j = rate_j * P / 100).  We predict P and E_j
-  at the target and take rate_j = E_j / P.  When a series is flat (no growth
-  signal, e.g. launch-night practice) we use a launch-surge prior instead
-  of pretending nothing will change: players keep growing (b = 1.5) while
-  each trophy's earners grow at the players log-rate scaled by the trophy's
-  current rate — a 100% trophy is earned by every newcomer so it stays at
-  100%, a rare one by almost none so its rate falls.  Quantile spread lives
-  s = sqrt((0.5*sqrt(days))^2 + fit_residual^2), q_tau =
-  inv_logit(logit(median) + z_tau * s).
+Model — regime-aware, and it never hardcodes any refresh (no practice
+numbers anywhere: no player count, no growth factor, no rate is baked in).
+  rate = earners / players_tracked.  The regime is detected from the
+  case's own history:
+  * GROWTH regime (players_tracked moves): fit, on the reads of the
+    current regime (after the last big jump in players_tracked, else the
+    last 24 h, else all reads), a power law in hours since release,
+    log(P) = a + b*log(1 + x) for players and log(E_j) = a_j + b_j*log(1
+    + x) for each trophy's earners (E_j = rate_j * P / 100).  Predict P
+    and E_j at the target and take rate_j = E_j / P.  This is the regime
+    the final case (f00) lives in: its history already holds the
+    post-refresh reads, so the growth is visible and fitted.
+  * STALE regime (players_tracked flat across every read — the page is a
+    frozen Exophase snapshot, as on launch night): the displayed count is
+    as old as the FIRST read, so the players multiplier is modelled with
+    a launch-night exponential prior — tracked players roughly double
+    every 2 hours in the opening night — applied over the STALENESS
+    window (first read -> target), capped at 12x.  Earners grow only via
+    newcomers: E_target = E_last * (1 + (G-1)*frac), frac = the trophy's
+    current rate, so a 100% trophy is earned by every newcomer and stays
+    at 100%, while a rare one's earners barely move and its rate falls by
+    ~the players multiplier.  The stale window is a lower bound (the page
+    may already have been stale at the first read), so the dilution is a
+    conservative estimate, and the spread below covers the rest.
+  Quantile spread lives on the logit scale: s = sqrt((0.5*sqrt(days))^2
+  + s_fit^2).  In the stale regime s_fit = 0.50, an honest width for a
+  refresh whose size is uncertain within about a factor of two either way
+  (the 90% band spans roughly median/2.3 to median*2.3).  In the growth
+  regime s_fit is the fit residual, floored at 0.50 so a deceptively clean
+  fit never claims more certainty than the model has.  A trophy at 100%
+  stays at 100%: all five quantiles are 100.0.
 
 Consistency (applied to the forecast medians, whole quantile vectors
 shifted in logit space so spreads are kept):
@@ -47,9 +64,15 @@ STORY_IDS = [2, 3, 4, 5, 6, 7]
 # the story chapters, never above the hardest chapter's rate.
 GRIND_IDS = {14, 15, 17, 18, 19, 25, 28, 30, 31, 32, 35, 42, 54, 55}
 
-# Launch-surge prior used only when a series shows no growth in history.
-PRIOR_PLAYERS_SLOPE = 1.5
-MIN_FIT_RESID = 0.30
+# Launch-night prior, used only when players_tracked is flat (stale page):
+# tracked players roughly double every 2 hours in the opening night.
+DOUBLING_HOURS = 2.0
+# Cap on the stale-regime players multiplier (4 doublings).
+MAX_G = 12.0
+# Logit spread (std) in the stale regime: honest width for a refresh whose
+# size is uncertain within about a factor of two either way.
+S_STALE = 0.50
+MIN_FIT_RESID = 0.50
 MAX_FIT_RESID = 1.00
 
 
@@ -145,18 +168,22 @@ def forecast_case(case):
 
     reg = regime_reads(reads)
     xs = [math.log1p(max(hours_since_release(t), 0.0)) for t, _, _ in reg]
+    ps = [p for _, p, _ in reg]
+    players_flat = len(set(ps)) < 2
 
     # --- players model ---
-    ps = [p for _, p, _ in reg]
-    if len(set(ps)) >= 2 and len(xs) >= 2:
+    if not players_flat and len(xs) >= 2:
         a_p, b_p, _ = linfit(xs, [math.log(p) for p in ps])
+        p_target = max(math.exp(a_p + b_p * x_target), ps[-1], 1.0)
     else:
-        # Flat players: intercept anchored at the last read, then the
-        # launch-surge prior slope from there.
-        b_p = PRIOR_PLAYERS_SLOPE
-        a_p = (math.log(ps[-1]) - b_p * xs[-1]) if ps and xs else 0.0
-    log_p_target = a_p + b_p * x_target
-    p_target = max(math.exp(log_p_target), ps[-1], 1.0)
+        # STALE regime: exponential launch prior over the staleness window
+        # (first read -> target), because the displayed count is that old.
+        staleness_h = (target_t - reads[0][0]).total_seconds() / 3600.0
+        staleness_h = max(staleness_h, 0.0)
+        g = 2.0 ** (staleness_h / DOUBLING_HOURS)
+        g = clamp(g, 1.0, MAX_G)
+        p_target = ps[-1] * g
+    g_mult = p_target / ps[-1] if ps[-1] > 0 else 1.0
 
     # --- per-trophy earners model ---
     s_rw = 0.5 * math.sqrt(max(horizon_days, 0.0))
@@ -179,25 +206,22 @@ def forecast_case(case):
                 break
         if last_rate is None:
             last_rate = 0.5
+        frac = clamp(last_rate, 0.01, 99.99) / 100.0
         if len(pts) >= 2 and len(set(y for _, y in pts)) >= 2:
             a_j, b_j, resid = linfit([x for x, _ in pts],
                                      [y for _, y in pts])
             s_fit = clamp(resid, MIN_FIT_RESID, MAX_FIT_RESID)
+            log_e_target = a_j + b_j * x_target
+            med = 100.0 * math.exp(log_e_target) / p_target
         else:
             # Flat earners: a newcomer earns this trophy with probability
             # ~ its current rate (a 100% trophy is earned by everyone, a
-            # rare one by almost no newcomer), so the earners log-slope is
-            # the players slope scaled by the last rate. Intercept anchored
-            # at the last read.
-            frac = clamp(last_rate, 0.01, 99.99) / 100.0
-            b_j = b_p * frac
-            if pts:
-                a_j = pts[-1][1] - b_j * pts[-1][0]
-            else:
-                a_j = math.log(max(last_rate, 0.01) / 100.0 * ps[-1])
-            s_fit = MIN_FIT_RESID
-        log_e_target = a_j + b_j * x_target
-        med = 100.0 * math.exp(log_e_target) / p_target
+            # rare one by almost no newcomer), so the earners multiplier
+            # is 1 + (G-1)*frac where G is the players multiplier.
+            e_last = frac * ps[-1]
+            e_target = e_last * (1.0 + (g_mult - 1.0) * frac)
+            med = 100.0 * e_target / p_target
+            s_fit = S_STALE if players_flat else MIN_FIT_RESID
         med = clamp(med, 0.01, 99.99)
         s = math.sqrt(s_rw * s_rw + s_fit * s_fit)
         lm = logit_pct(med)
@@ -248,13 +272,23 @@ def forecast_case(case):
             if tid in rows and rows[tid][2] > cap:
                 shift_vector(tid, cap)
 
-    # Final cleanup: clamp + non-decreasing + 4 decimals.
+    # A trophy at 100% stays at 100%: every newcomer earns it, so all
+    # five quantiles are 100.0 when the last rate is 100 and the model
+    # agrees it stays there.
+    last_rates = {}
+    for _, _, rates in reversed(reads):
+        for j, tr in enumerate(trophies):
+            if tr["id"] not in last_rates and j < len(rates) \
+                    and rates[j] is not None:
+                last_rates[tr["id"]] = float(rates[j])
     out = []
     for tr in trophies:
         q = rows.get(tr["id"])
         if q is None:
             q = [0.5, 0.5, 0.5, 0.5, 0.5]
-        q = [round(clamp(v, 0.01, 99.99), 4) for v in q]
+        if last_rates.get(tr["id"], 0.0) >= 99.99 and q[2] >= 99.9:
+            q = [100.0, 100.0, 100.0, 100.0, 100.0]
+        q = [round(clamp(v, 0.01, 100.0), 4) for v in q]
         for k in range(1, 5):
             if q[k] < q[k - 1]:
                 q[k] = q[k - 1]
